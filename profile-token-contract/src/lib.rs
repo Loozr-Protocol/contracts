@@ -7,7 +7,7 @@ use near_sdk::collections::LazyOption;
 use near_sdk::json_types::U128;
 use near_sdk::{
     assert_one_yocto, env, ext_contract, log, near_bindgen, require, AccountId, Balance,
-    BorshStorageKey, PanicOnDefault, PromiseOrValue,
+    BorshStorageKey, PanicOnDefault, Promise, PromiseOrValue,
 };
 use rust_decimal::prelude::*;
 
@@ -75,7 +75,7 @@ impl Contract {
     }
 
     pub fn lzr_locked_in(self) -> U128 {
-      self.lzr_locked.into()
+        self.lzr_locked.into()
     }
 
     // should only be called after tokens have been transfered to contract
@@ -120,21 +120,33 @@ impl Contract {
         ext_ft_transfer::ext(get_lzr_contract())
             .with_attached_deposit(1)
             .ft_transfer(env::predecessor_account_id(), reimburse_amount.into())
-            .then(Self::ext(env::current_account_id()).on_transfer_callback(sell_amount.into(), reimburse_amount.into(), env::predecessor_account_id()));
+            .then(Self::ext(env::current_account_id()).on_transfer_callback(
+                sell_amount.into(),
+                reimburse_amount.into(),
+                env::predecessor_account_id().into(),
+                env::attached_deposit().into(),
+            ));
     }
 
     #[private]
     pub fn on_transfer_callback(
         &mut self,
-        #[callback_result] call_result: Result<(), near_sdk::PromiseError>, sell_amount: U128, reimburse_amount: U128, account_id: AccountId
+        #[callback_result] call_result: Result<(), near_sdk::PromiseError>,
+        sell_amount: U128,
+        reimburse_amount: U128,
+        account_id: AccountId,
+        attached_deposit: U128,
     ) {
         // Return whether or not the promise succeeded using the method outlined in external.rs
         if call_result.is_err() {
-           self.internal_mint(sell_amount.into(), account_id);
-           self.lzr_locked = self
-            .lzr_locked
-            .checked_add(reimburse_amount.into())
-            .unwrap_or_else(|| env::panic_str("Reserve balance overflow"));
+            let predecessor_account_id = account_id.clone();
+            self.internal_mint(sell_amount.into(), account_id);
+            self.lzr_locked = self
+                .lzr_locked
+                .checked_add(reimburse_amount.into())
+                .unwrap_or_else(|| env::panic_str("Reserve balance overflow"));
+
+            Promise::new(predecessor_account_id).transfer(attached_deposit.0);
         }
     }
 
