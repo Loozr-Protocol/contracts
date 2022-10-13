@@ -28,9 +28,9 @@ impl CreatorCoinFactory {
 
         Promise::new(creator_coin_account_id.parse().unwrap())
             .create_account()
-            .deploy_contract(CODE.to_vec())
             .transfer(env::attached_deposit())
             .add_full_access_key(env::signer_account_pk())
+            .deploy_contract(CODE.to_vec())
             .function_call(
                 "new_default_meta".into(),
                 near_sdk::serde_json::to_vec(&CreatorCoinArgs { owner_id }).unwrap(),
