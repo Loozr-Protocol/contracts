@@ -77,29 +77,34 @@ impl Contract {
     // should only be called after tokens have been transfered to contract
     #[private]
     #[payable]
-    pub fn ft_mint(&mut self, amount: U128, account_id: AccountId, founder_id: AccountId, founder_percent: U128) {
+    pub fn ft_mint(
+        &mut self,
+        amount: U128,
+        account_id: AccountId,
+        founder_id: AccountId,
+        founder_percent: U128,
+    ) -> Promise {
         assert_one_yocto();
-        
+
         let amount: Balance = amount.into();
         let founder_reward_percent: Balance = founder_percent.into();
         let founder_reward_amount = (amount * founder_reward_percent) / 100;
-        let deposit_amount = amount - (amount * 10) /100;
+        let deposit_amount = amount - (amount * 10) / 100;
 
         require!(deposit_amount > 0, "Must send loozr to buy tokens");
-        let amount_in_near = Decimal::from_i128_with_scale(deposit_amount as i128, TOKEN_DECIMAL);
-        self.continous_mint(amount_in_near, deposit_amount, account_id);
+        let tokens_minted = self.continous_mint(deposit_amount, account_id);
 
         ext_ft_transfer::ext(get_lzr_token_contract())
             .with_attached_deposit(1)
             .ft_transfer(founder_id, founder_reward_amount.into())
-            .then(Self::ext(env::current_account_id()).on_transfer_callback());
+            .then(Self::ext(env::current_account_id()).on_transfer_callback(tokens_minted))
     }
 
     #[private]
     #[payable]
-    pub fn ft_burn(&mut self, sell_amount: U128, account_id: AccountId) {
-      let user_account_id: AccountId = account_id.clone();
-      let cl_user_account_id: AccountId = user_account_id.clone();
+    pub fn ft_burn(&mut self, sell_amount: U128, account_id: AccountId) -> Promise {
+        let user_account_id: AccountId = account_id.clone();
+        let cl_user_account_id: AccountId = user_account_id.clone();
         assert_one_yocto();
         let sell_amount: Balance = sell_amount.into();
         require!(sell_amount > 0, "Amount must be non-zero.");
@@ -127,21 +132,31 @@ impl Contract {
             lzr_locked_in_near,
             amount_in_near,
             sell_amount,
-            account_id
+            account_id,
         );
         ext_ft_transfer::ext(get_lzr_token_contract())
             .with_attached_deposit(1)
             .ft_transfer(cl_user_account_id, reimburse_amount.into())
-            .then(Self::ext(env::current_account_id()).on_burn_transfer_callback(
-                sell_amount.into(),
-                reimburse_amount.into(),
-                env::predecessor_account_id().into(),
-                env::attached_deposit().into(),
-            ));
+            .then(
+                Self::ext(env::current_account_id()).on_burn_transfer_callback(
+                    sell_amount.into(),
+                    reimburse_amount.into(),
+                    env::predecessor_account_id().into(),
+                    env::attached_deposit().into(),
+                ),
+            )
     }
 
     #[private]
-    pub fn on_transfer_callback(){}
+    pub fn on_transfer_callback(&mut self,
+        #[callback_result] call_result: Result<(), near_sdk::PromiseError>, tokens_minted: U128) -> PromiseOrValue<U128> {
+
+          if call_result.is_err() {
+             env::panic_str("Reserve balance overflow")
+          }else {
+            PromiseOrValue::Value(tokens_minted)
+          }
+    }
 
     #[private]
     pub fn on_burn_transfer_callback(
@@ -151,7 +166,7 @@ impl Contract {
         reimburse_amount: U128,
         account_id: AccountId,
         attached_deposit: U128,
-    ) {
+    ) -> PromiseOrValue<U128> {
         // Return whether or not the promise succeeded using the method outlined in external.rs
         if call_result.is_err() {
             let predecessor_account_id = account_id.clone();
@@ -162,6 +177,9 @@ impl Contract {
                 .unwrap_or_else(|| env::panic_str("Reserve balance overflow"));
 
             Promise::new(predecessor_account_id).transfer(attached_deposit.0);
+            PromiseOrValue::Value(0.into())
+        }else {
+          PromiseOrValue::Value(reimburse_amount)
         }
     }
 
@@ -171,7 +189,7 @@ impl Contract {
         lzr_locked_in_near: Decimal,
         amount_in_near: Decimal,
         sell_amount: u128,
-        account_id: AccountId
+        account_id: AccountId,
     ) -> u128 {
         let reimburse_amount = self.calc_sales_return(
             current_supply_in_near,
@@ -189,19 +207,15 @@ impl Contract {
         reimburse_amount
     }
 
-    fn continous_mint(
-        &mut self,
-        _deposit: Decimal,
-        _amount_in_yocto_near: u128,
-        account_id: AccountId,
-    ) {
+    fn continous_mint(&mut self, _deposit: u128, account_id: AccountId) -> U128 {
         let amount = self.calc_purchase_return(_deposit);
 
         self.lzr_locked = self
             .lzr_locked
-            .checked_add(_amount_in_yocto_near)
+            .checked_add(_deposit)
             .unwrap_or_else(|| env::panic_str("Reserve balance overflow"));
         self.internal_mint(amount, account_id);
+        amount.into()
     }
 
     fn calc_sales_return(
@@ -235,28 +249,30 @@ impl Contract {
         return result_in_str.parse::<u128>().unwrap();
     }
 
-    fn calc_purchase_return(&mut self, _deposit: Decimal) -> u128 {
+    fn calc_purchase_return(&mut self, _deposit: u128) -> u128 {
+        let deposit_in_near = Decimal::from_i128_with_scale(_deposit as i128, TOKEN_DECIMAL);
+        let total_supply_in_near =
+            Decimal::from_i128_with_scale(self.token.total_supply as i128, TOKEN_DECIMAL);
+
         if self.lzr_locked == 0 {
             return self.calc_mint_polynomial(
-                _deposit,
-                self.token.total_supply,
+                deposit_in_near,
+                total_supply_in_near,
                 RESERVE_RATIO,
                 Decimal::from_f64(SLOPE).unwrap(),
             );
         }
 
-        return self.calc_mint_bancor(_deposit, self.token.total_supply);
+        return self.calc_mint_bancor(deposit_in_near, total_supply_in_near);
     }
 
     fn calc_mint_polynomial(
         &self,
         amount: Decimal,
-        current_supply: u128,
+        current_supply: Decimal,
         reserve_ratio: f64,
         slope: Decimal,
     ) -> u128 {
-        let current_supply_in_near =
-            Decimal::from_i128_with_scale(current_supply as i128, TOKEN_DECIMAL);
         let increase_rate: u32 = 3; // 2(increase rate +1)
 
         //This is the formula:
@@ -273,17 +289,15 @@ impl Contract {
             Decimal::from_f64((increase_rate as f64) * self.decimal_to_float(amount)).unwrap()
                 / slope,
         ) + (self
-            .decimal_to_float(current_supply_in_near)
+            .decimal_to_float(current_supply)
             .powf(increase_rate as f64) as f64))
             .powf(reserve_ratio))
-            - self.decimal_to_float(current_supply_in_near);
+            - self.decimal_to_float(current_supply);
 
         return (result * BASE.pow(TOKEN_DECIMAL) as f64) as u128;
     }
 
-    fn calc_mint_bancor(&self, amount: Decimal, current_supply: u128) -> u128 {
-        let current_supply_in_near =
-            Decimal::from_i128_with_scale(current_supply as i128, TOKEN_DECIMAL);
+    fn calc_mint_bancor(&self, amount: Decimal, current_supply: Decimal) -> u128 {
         //This is the formula:
         // x * ((1 + p / rb) ^ (r) - 1)
         //
@@ -297,7 +311,7 @@ impl Contract {
             Decimal::from_i128_with_scale(self.lzr_locked as i128, TOKEN_DECIMAL);
 
         let mut result = amount / lzr_locked_in_near;
-        result = current_supply_in_near
+        result = current_supply
             * Decimal::from_f64((1. + self.decimal_to_float(result)).powf(RESERVE_RATIO) - 1.)
                 .unwrap();
 
@@ -323,7 +337,7 @@ impl Contract {
         }
         self.internal_update_account(&user_account_id, balance - amount);
         if amount > self.token.total_supply {
-          env::panic_str("AMOUNT BIGGER THAN SUPPLY");
+            env::panic_str("AMOUNT BIGGER THAN SUPPLY");
         }
         self.token.total_supply = self
             .token
@@ -408,18 +422,21 @@ mod tests {
         if contract.ft_total_supply().0 != 0 {
             env::panic_str("INCORRECT SUPPLY");
         }
-        contract.ft_mint(10000000000000000000000000.into(), accounts(1), accounts(2), 10.into());
+        contract.ft_mint(
+            10000000000000000000000000.into(),
+            accounts(1),
+            accounts(2),
+            10.into(),
+        );
         let balance = contract.ft_total_supply();
-        let creator_token_minted: u128 = 21544346900318829112459264;
+        let creator_token_minted: u128 = 20800838230519037072244736;
 
         if balance.0 < 1 {
             env::panic_str("ERROR IN CONTINOUS MINTING");
         }
-
         if balance.0 != creator_token_minted {
             env::panic_str("INCORRECT MINTING FUNCTION");
         }
-
         // contract.ft_burn(21544346900318829112459264.into());
 
         if balance.0 != creator_token_minted {
@@ -433,11 +450,7 @@ mod tests {
         let context = get_context(accounts(1));
         testing_env!(context.build());
         let mut _contract = Contract::default();
-        _contract.continous_mint(
-            Decimal::from_u128(10).unwrap(),
-            9999999999999999000000000,
-            accounts(1),
-        );
+        _contract.continous_mint(10, accounts(1));
     }
 
     #[test]
@@ -459,11 +472,7 @@ mod tests {
             .predecessor_account_id(accounts(2))
             .build());
 
-        contract.continous_mint(
-            Decimal::from_u128(500).unwrap(),
-            500000000000000000000000000,
-            accounts(1),
-        );
+        contract.continous_mint(500000000000000000000000000, accounts(1));
 
         testing_env!(context
             .storage_usage(env::storage_usage())
